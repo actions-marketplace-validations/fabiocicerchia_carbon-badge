@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "carbon-badge"
-version = "0.6.0"
+version = "0.7.4"
 description = "Shields-style README badge for a repo's CI carbon footprint"
 readme = "README.md"
 license = "Apache-2.0"
@@ -21,7 +21,7 @@ classifiers = [
 dependencies = ["requests>=2.31"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.4", "build>=1.2"]
+dev = ["pytest>=8.0", "ruff>=0.4", "build>=1.2", "basedpyright>=1.31"]
 
 [project.urls]
 Homepage = "https://github.com/fabiocicerchia/carbon-badge"
@@ -32,7 +32,79 @@ Changelog = "https://github.com/fabiocicerchia/carbon-badge/blob/main/CHANGELOG.
 carbon-badge = "carbon_badge:main"
 
 [tool.setuptools]
-py-modules = ["carbon_badge"]
+packages = ["carbon_badge"]
 
 [tool.ruff]
-line-length = 100
+line-length = 120
+
+[tool.pytest.ini_options]
+# Without this pytest imports an installed carbon_badge from site-packages
+# instead of the module in this checkout, so the suite can pass (or fail)
+# against code that is not in the tree.
+pythonpath = ["."]
+
+[tool.ruff.lint]
+select = [
+  "E", "W", "F", "I", "N", "UP", "ANN", "ASYNC", "S", "B", "A", "C4", "DTZ",
+  "T20", "PT", "RET", "SIM", "PTH", "ERA", "TD", "FIX", "PLR2004", "TRY", "PL", "RUF",
+]
+# Nothing is ignored repo-wide. ANN401 has three call sites that forward to
+# BaseHTTPRequestHandler and carry a `# noqa` with the reason; TRY003's messages
+# moved into RunnerWattsError, where the rule wants them.
+
+[tool.ruff.lint.flake8-annotations]
+mypy-init-return = true
+
+[tool.ruff.lint.per-file-ignores]
+# `assert` is what a test is, and an expected value is the literal it compares
+# against -- naming it moves the assertion one step from the thing asserted.
+"tests/**" = [
+  "S101",     # `assert` is what a test is
+  "PLR2004",  # an expected value is the literal it compares against
+  "ANN001",   # a fixture or a fake's argument, named by the test that builds it
+  "ANN202",   # ditto a fake's return: it is whatever the code under test reads
+  "TRY003",   # a fake raising RuntimeError("provider down") does not want a
+              # class of its own -- the message *is* the fixture
+  "ANN401",   # a fake response mirrors requests.Response.json(), which is Any
+]
+
+[tool.basedpyright]
+# FC-PY-003 asks for strict. The point of a type checker in CI is that it knows
+# the types: "unknown" is the finding, not a level of detail to relax away.
+typeCheckingMode = "strict"
+# Matches requires-python, so the checker rejects what the oldest supported
+# interpreter would reject rather than what this machine happens to run.
+pythonVersion = "3.10"
+# Third-party stubs are not this repository's to ship, and a missing one is a
+# packaging fact about someone else's project rather than a defect here.
+reportMissingTypeStubs = false
+# The module is a single file at the repo root, which tests/ imports directly.
+extraPaths = ["."]
+
+# The tests exercise this module's internals on purpose -- the paging cap, the
+# per-provider grid readers, the estimated-class counter -- so reaching for a
+# `_name` there is the test doing its job, not a leak.
+[[tool.basedpyright.executionEnvironments]]
+root = "tests"
+reportPrivateUsage = false
+
+[[tool.basedpyright.executionEnvironments]]
+# carbon_badge is one unit that happens to be spread over several files. A leading
+# underscore here means "private to the package", which is the usual Python
+# convention -- but the checker scopes it to the *file*, so every helper the
+# package shares between its own modules reads as private-used-elsewhere and
+# as unaccessed. Those reports are about the file boundary, not the code.
+#
+# Anything reaching in from outside the package is still caught: this scope is
+# the package directory and nothing else.
+root = "carbon_badge"
+reportPrivateUsage = false
+reportUnusedFunction = false
+reportUnusedClass = false
+extraPaths = ["."]
+
+# The man page rides along in the wheel: `pip install` puts it under
+# <prefix>/share/man/man1, which is on the default manpath for a system install
+# and for a --user one alike.
+[tool.setuptools.data-files]
+"share/man/man1" = ["man/carbon-badge.1"]

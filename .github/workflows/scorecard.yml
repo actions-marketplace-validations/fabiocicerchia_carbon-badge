@@ -1,37 +1,43 @@
+# Managed centrally — edit the shared config, not this copy.
+#
+# One `common` overlay covers public and private repos alike; the job below
+# guards itself instead of the overlay tree branching. OpenSSF Scorecard only
+# has anything to say about public repos, so on a private one this no-ops.
 name: scorecard
-
-# OpenSSF Scorecard: rates the repo's security posture (branch protection,
-# pinned deps, token permissions, etc.) and uploads results to the Security tab.
-# Public repos: results also appear at deps.dev / the Scorecard badge.
 
 on:
   branch_protection_rule:
   schedule:
-    - cron: "0 6 * * 1" # weekly
-  push:
-    branches: [main]
+    - cron: "41 5 * * 2"
+  # No push trigger: the pull request already ran this on the identical
+  # tree. What a merge cannot tell you, the schedule below can.
+  workflow_dispatch:
 
 permissions: read-all
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   analysis:
+    # GitHub Advanced Security is required for this on private repos; skip instead of failing red.
+    if: ${{ !github.event.repository.private }}
     runs-on: ubuntu-latest
     permissions:
-      security-events: write # upload SARIF
-      id-token: write # publish results (public repos)
+      security-events: write
+      id-token: write
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
-      - uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc  # v2.4.4
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc  # v2.4.4
         with:
           results_file: results.sarif
           results_format: sarif
           publish_results: true
-      - uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
+
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63  # v4.38.0
         with:
           sarif_file: results.sarif
