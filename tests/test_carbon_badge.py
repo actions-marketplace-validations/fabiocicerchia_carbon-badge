@@ -6,9 +6,10 @@ import logging
 import re
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn
 
 import pytest
@@ -130,7 +131,7 @@ def test_unknown_runners_are_charged_not_skipped(
 ) -> None:
     """Skipping self-hosted scored it as zero, so moving a build onto the
     biggest machine you own improved the badge. It's charged and reported now."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     runs = [{"id": 1}]
     jobs = [
         {
@@ -346,9 +347,27 @@ def test_parse_carbon_artifact() -> None:
     # A repo's ordinary artifacts share the listing and must be ignored.
     assert carbon_badge.parse_carbon_artifact("gitleaks-results.sarif") is None
     assert carbon_badge.parse_carbon_artifact("github-pages") is None
-    # A future format must not be silently misread as v1.
+    # A future format must not be silently misread as v1, nor a malformed v2.
+    assert carbon_badge.parse_carbon_artifact("carbon.v3.142.2.7168.ubuntu.eastus.37.build") is None
     assert carbon_badge.parse_carbon_artifact("carbon.v2.142.2.7168.build") is None
     assert carbon_badge.parse_carbon_artifact("") is None
+
+
+def test_v2_markers_carry_a_measured_load() -> None:
+    """v2 inserts the job's CPU utilisation before the slug; v1 has none."""
+    name = "carbon.v2.142.4.16384.ubuntu.eastus.37.build-a1b2c3d4"
+    assert carbon_badge.parse_carbon_artifact(name) == (142.0, 4, 16384, "ubuntu", "eastus")
+    assert carbon_badge.carbon_artifact_load(name) == 0.37
+    # The utilisation field must not leak into the slug the reconciliation keys on.
+    assert carbon_badge.carbon_artifact_slug(name) == "build-a1b2c3d4"
+    assert carbon_badge.carbon_artifact_load("carbon.v1.142.4.16384.ubuntu.eastus.build") is None
+    assert carbon_badge.carbon_artifact_load("carbon.v2.142.4.16384.ubuntu.eastus.100.build") == 1.0
+    # Busy/total cannot exceed 100%; such a name is not ours, so it is not a
+    # marker at all rather than a recorded job priced at full load.
+    bogus = "carbon.v2.142.4.16384.ubuntu.eastus.250.build"
+    assert carbon_badge.carbon_artifact_load(bogus) is None
+    assert carbon_badge.parse_carbon_artifact(bogus) is None
+    assert carbon_badge.carbon_artifact_slug(bogus) is None
 
 
 def test_the_two_pricing_paths_agree_at_every_size() -> None:
@@ -403,7 +422,7 @@ def _artifact(name: str, run_id: int, created: str | None = None, expired: bool 
     return {
         "name": name,
         "workflow_run": {"id": run_id},
-        "created_at": created or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "created_at": created or datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "expired": expired,
     }
 
@@ -454,11 +473,32 @@ def test_artifact_kwh_by_run_keys_by_run_and_downloads_nothing(monkeypatch: pyte
     assert not any("/jobs" in u or u.endswith("/zip") for u in calls)
 
 
+def test_a_measured_load_prices_the_marker_below_full_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A job that measured its utilisation is priced at it, not at the full-load
+    ceiling; one that did not stays at full load; --load-factor beats both."""
+    artifacts = [
+        _artifact("carbon.v2.3600.4.16384.ubuntu.eastus.25.io-bound", 1),
+        _artifact("carbon.v1.3600.4.16384.ubuntu.eastus.unmeasured", 2),
+    ]
+    monkeypatch.setattr(carbon_badge.ci.requests, "get", _serve(artifacts, [], []))
+    try:
+        carbon_badge.power.LOAD_FACTOR = None
+        by_run, _jobs = carbon_badge.artifact_kwh_by_run("o/r", token=None)
+        assert by_run[1].kwh == pytest.approx(3.87 / 1000, abs=1e-5)
+        assert by_run[2].kwh == pytest.approx(9.4 / 1000, abs=1e-5)
+
+        carbon_badge.power.LOAD_FACTOR = 1.0  # the documented way back to the ceiling
+        by_run, _jobs = carbon_badge.artifact_kwh_by_run("o/r", token=None)
+        assert by_run[1].kwh == pytest.approx(9.4 / 1000, abs=1e-5)
+    finally:
+        carbon_badge.power.LOAD_FACTOR = None
+
+
 def test_partial_instrumentation_tops_up_from_the_api(monkeypatch: pytest.MonkeyPatch) -> None:
     """The realistic state. Self-reported runs are used as-is; only the rest
     cost a request. Accurate throughout, and cheaper with every workflow you
     instrument — rather than all-or-nothing at some threshold."""
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     runs = [{"id": i, "workflow_id": 7, "run_started_at": now, "updated_at": now} for i in (1, 2, 3, 4)]
     artifacts = [
         _artifact("carbon.v1.3600.2.7168.ubuntu.eastus.a", 1),
@@ -485,7 +525,7 @@ def test_partial_instrumentation_tops_up_from_the_api(monkeypatch: pytest.Monkey
 def test_full_coverage_costs_one_sample_per_workflow(monkeypatch: pytest.MonkeyPatch) -> None:
     """Fully instrumented: one sampled run per workflow to establish the job
     count, and nothing else."""
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     runs = [{"id": i, "workflow_id": 7, "run_started_at": now, "updated_at": now} for i in (1, 2, 3)]
     artifacts = [_artifact(f"carbon.v1.3600.2.7168.ubuntu.eastus.j{i}", i) for i in (1, 2, 3)]
     calls: list[str] = []
@@ -500,7 +540,7 @@ def test_full_coverage_costs_one_sample_per_workflow(monkeypatch: pytest.MonkeyP
 def test_ignore_self_reported_does_not_consult_artifacts(monkeypatch: pytest.MonkeyPatch) -> None:
     """--ignore-self-reported must not touch the artifacts listing at all,
     otherwise the two paths cannot be reconciled against each other."""
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     runs = [{"id": 1, "workflow_id": 7, "run_started_at": now, "updated_at": now}]
     calls: list[str] = []
     monkeypatch.setattr(
@@ -515,7 +555,7 @@ def test_ignore_self_reported_does_not_consult_artifacts(monkeypatch: pytest.Mon
 
 def test_expired_and_out_of_window_markers_are_ignored(monkeypatch: pytest.MonkeyPatch) -> None:
     """Retention outlives the window, so old markers must not inflate a month."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     fresh = now.isoformat().replace("+00:00", "Z")
     old = (now - timedelta(days=40)).isoformat().replace("+00:00", "Z")
     artifacts = [
@@ -541,7 +581,7 @@ def test_declared_watts_still_beat_the_model(monkeypatch: pytest.MonkeyPatch) ->
 
 
 def _job(labels: list[str], minutes: float) -> Json:
-    start = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc)
+    start = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
     end = start + timedelta(minutes=minutes)
     return {
         "labels": labels,
@@ -553,7 +593,7 @@ def _job(labels: list[str], minutes: float) -> Json:
 def test_gitlab_kwh_charges_self_managed_runners(monkeypatch: pytest.MonkeyPatch) -> None:
     """Self-managed runners used to be skipped — scored as zero emissions, the
     same perverse incentive as the GitHub path. Both jobs are charged now."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     jobs_page1 = [
         {"created_at": now, "duration": 3600, "runner": {"is_shared": True}},
         {"created_at": now, "duration": 3600, "runner": {"is_shared": False}},
@@ -576,9 +616,26 @@ def test_gitlab_kwh_charges_self_managed_runners(monkeypatch: pytest.MonkeyPatch
     assert carbon_badge.confidence(usage) == "rough"
 
 
+def test_gitlab_takes_an_injected_getter() -> None:
+    """The HTTP client is passed in, so the pricing runs without patching requests."""
+    now = datetime.now(UTC).isoformat()
+
+    def fake_get(
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> _FakeResponse:
+        return _FakeResponse([{"created_at": now, "duration": 3600}] if _page(params) == 1 else [])
+
+    usage = carbon_badge.gitlab_kwh_last_30d("group/project", token=None, get=fake_get)
+    assert round(usage.kwh, 6) == round(carbon_badge.DEFAULT_RUNNER_POWER_W / 1000, 6)
+
+
 def test_gitlab_runner_watts_matches_on_tags(monkeypatch: pytest.MonkeyPatch) -> None:
     """Tags and the runner description are GitLab's equivalent of a label."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     jobs_page1 = [
         {
             "created_at": now,
@@ -639,16 +696,64 @@ def test_serve_badge_endpoint_caches_and_404s() -> None:
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     try:
-        url = f"http://127.0.0.1:{port}/badge.json"
-        body = urllib.request.urlopen(url, timeout=5).read()
+        body = urllib.request.urlopen(f"http://127.0.0.1:{port}/badge.json", timeout=5).read()  # nosec B310 — fixed http://127.0.0.1 URL
         assert json.loads(body)["label"] == "CI carbon"
-        urllib.request.urlopen(url, timeout=5).read()
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/badge.json", timeout=5).read()  # nosec B310
         assert calls["n"] == 1  # second hit within ttl served from cache
         with pytest.raises(urllib.error.HTTPError):
-            urllib.request.urlopen(f"http://127.0.0.1:{port}/nope", timeout=5)
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/nope", timeout=5)  # nosec B310
     finally:
         httpd.shutdown()
         thread.join(timeout=5)
+
+
+def test_github_client_over_real_http() -> None:
+    """ci_kwh_last_30d against a local GitHub stand-in, with no fake `get`:
+    real requests encodes the query, sends the token and pages the jobs
+    listing past one full page, so a regression in any of them shows here."""
+    seen: list[tuple[str, dict[str, list[str]], str | None]] = []
+    jobs = [_job(["ubuntu-latest"], 6) for _ in range(101)]
+
+    class FakeGitHub(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlsplit(self.path)
+            query = urllib.parse.parse_qs(parsed.query)
+            seen.append((parsed.path, query, self.headers.get("Authorization")))
+            page, size = int(query["page"][0]), int(query["per_page"][0])
+            if parsed.path == "/repos/owner/repo/actions/runs":
+                payload: Json = {"total_count": 1, "workflow_runs": [{"id": 7}] if page == 1 else []}
+            elif parsed.path == "/repos/owner/repo/actions/runs/7/jobs":
+                payload = {"jobs": jobs[(page - 1) * size : page * size]}
+            else:
+                payload = {"artifacts": []}
+            body = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), FakeGitHub)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        usage = carbon_badge.ci_kwh_last_30d(
+            "owner/repo", "t0ken", api=f"http://127.0.0.1:{httpd.server_address[1]}", grid_override=480.0
+        )
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+
+    assert usage.total_jobs == 101
+    assert usage.kwh == pytest.approx(101 * 6 / 60 * carbon_badge.DEFAULT_RUNNER_POWER_W / 1000)
+    assert all(auth == "Bearer t0ken" for _, _, auth in seen)
+    job_pages = [q["page"] for path, q, _ in seen if path.endswith("/jobs")]
+    assert job_pages == [["1"], ["2"]]
+    runs_query = next(q for path, q, _ in seen if path.endswith("/runs"))
+    assert runs_query["created"][0].startswith(">=")
 
 
 def test_a_partly_instrumented_run_does_not_lose_its_other_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -659,7 +764,7 @@ def test_a_partly_instrumented_run_does_not_lose_its_other_jobs(monkeypatch: pyt
     sibling — an 11x undercount that still reported confidence "measured",
     because a marker proves *a* job reported, not that all of them did.
     """
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     runs = [{"id": 1, "workflow_id": 7, "run_started_at": now, "updated_at": now}]
     # The API says this run had two jobs; only one wrote a marker.
     jobs = [_job(["ubuntu-latest"], 60), _job(["ubuntu-latest"], 600)]
@@ -692,7 +797,7 @@ def test_a_partly_instrumented_run_does_not_lose_its_other_jobs(monkeypatch: pyt
 
 def test_markers_are_not_double_counted_when_a_run_is_topped_up(monkeypatch: pytest.MonkeyPatch) -> None:
     """Topping up must replace the partial markers, not add to them."""
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     runs = [{"id": 1, "workflow_id": 7, "run_started_at": now, "updated_at": now}]
     jobs = [_job(["ubuntu-latest"], 60), _job(["ubuntu-latest"], 60)]
 
@@ -755,7 +860,7 @@ def test_undeclared_warning_never_suggests_a_command_that_will_not_parse(caplog:
 def test_gitlab_honours_a_blanket_override_on_untagged_jobs(monkeypatch: pytest.MonkeyPatch) -> None:
     """Untagged is the common GitLab case; an `if tags` guard skipped the
     blanket figure entirely and priced a 180 W fleet at the 9.4 W baseline."""
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(UTC).isoformat()
     jobs_page1 = [{"created_at": now, "duration": 3600, "runner": {"is_shared": True}}]
 
     def fake_get(
@@ -781,7 +886,7 @@ def test_an_unusually_small_newest_run_cannot_lower_the_bar(monkeypatch: pytest.
     A marker cannot outnumber its run's jobs, so the highest marker count seen
     for the workflow is a free lower bound and the larger of the two wins.
     """
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     # Newest run had a single job. An older one ran three, fully instrumented.
     # The middle one ran three and reported two — the case that must not pass.
     runs = [
@@ -834,7 +939,7 @@ def test_skipped_jobs_do_not_make_completeness_unreachable(monkeypatch: pytest.M
     instrumented workflow still paying an API call every run, forever. That is
     the failure mode where the whole feature stops earning its overhead.
     """
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     runs = [{"id": 1, "workflow_id": 9, "run_started_at": now, "updated_at": now}]
     api_jobs = [
         dict(_job(["ubuntu-latest"], 8), name="release-please", conclusion="success"),
@@ -873,7 +978,7 @@ def test_skipped_jobs_do_not_make_completeness_unreachable(monkeypatch: pytest.M
 def test_skipped_jobs_contribute_no_energy(monkeypatch: pytest.MonkeyPatch) -> None:
     """They also carry timestamps, sometimes with completed_at *before*
     started_at, so they must be dropped rather than clamped to zero."""
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     runs = [{"id": 1, "workflow_id": 9, "run_started_at": now, "updated_at": now}]
     api_jobs = [
         dict(_job(["ubuntu-latest"], 60), name="real", conclusion="success"),
@@ -1139,17 +1244,23 @@ class TestLoadFactor:
     """--load-factor: what to do about a flat wattage on an I/O-bound job."""
 
     def setup_method(self) -> None:
-        carbon_badge.power.LOAD_FACTOR = 1.0
+        carbon_badge.power.LOAD_FACTOR = None
 
     def teardown_method(self) -> None:
-        carbon_badge.power.LOAD_FACTOR = 1.0
+        carbon_badge.power.LOAD_FACTOR = None
 
-    def test_default_is_unchanged_behaviour(self) -> None:
-        # The API exposes no utilisation, so full load stays the default: the
-        # honest reading of "we do not know" for a number that should not
-        # flatter the caller.
+    def test_default_is_full_load_without_a_measurement(self) -> None:
+        # The API exposes no utilisation, so a job with no measured load is
+        # priced at full load: the honest reading of "we do not know" for a
+        # number that should not flatter the caller.
         assert carbon_badge.watts_from_specs(4, 16 * 1024) == 9.4
         assert carbon_badge.runner_power_w(["ubuntu-latest"]) == 9.4
+
+    def test_a_measured_load_prices_macos_too(self) -> None:
+        # Apple hardware is priced off its own table entry, not the vCPU law,
+        # and must still honour the job's measurement.
+        full = carbon_badge.watts_from_specs(3, 7 * 1024, "macos")
+        assert carbon_badge.watts_from_specs(3, 7 * 1024, "macos", 0.25) < full
 
     def test_only_the_variable_part_scales(self) -> None:
         # A machine at 0% CPU still draws its idle power, so a load factor of
@@ -1203,7 +1314,7 @@ def _dt(stamp: str) -> datetime:
 
 
 def _now_z():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _ci_snapshot(generated_at: str = "2026-08-08T18:00:00Z") -> Json:
@@ -1373,7 +1484,7 @@ def test_pue_is_applied_once_and_stays_its_own_constant() -> None:
 
 
 def _named_job(labels: list[str], minutes: float, name: str, start_offset: float = 0) -> Json:
-    start = datetime(2026, 8, 1, 0, 0, tzinfo=timezone.utc) + timedelta(minutes=start_offset)
+    start = datetime(2026, 8, 1, 0, 0, tzinfo=UTC) + timedelta(minutes=start_offset)
     end = start + timedelta(minutes=minutes)
     return {
         "name": name,
@@ -1408,7 +1519,7 @@ def _serve_named(
 def _one_run_repo(marker_seconds: float, job_minutes: float) -> tuple[list[Json], list[Json], list[Json]]:
     """One run, one job. The marker says `marker_seconds`; the API bills
     `job_minutes` — the difference is the setup the marker never saw."""
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     runs = [{"id": 1, "workflow_id": 7, "run_started_at": now, "updated_at": now}]
     artifacts = [_artifact(f"carbon.v1.{marker_seconds}.2.7168.ubuntu.eastus.build", 1)]
     jobs = [_named_job(["ubuntu-latest"], job_minutes, "build")]
@@ -1483,7 +1594,7 @@ def test_an_explicit_grid_figure_removes_the_grid_term(monkeypatch: pytest.Monke
 def test_a_partly_instrumented_run_is_not_compared(monkeypatch: pytest.MonkeyPatch) -> None:
     """It would show a divergence that is only the missing jobs, which is none
     of the three things this report is about."""
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     runs = [{"id": 1, "workflow_id": 7, "run_started_at": now, "updated_at": now}]
     artifacts = [_artifact("carbon.v1.600.2.7168.ubuntu.eastus.build", 1)]  # one of two
     jobs = [
@@ -1498,11 +1609,12 @@ def test_a_partly_instrumented_run_is_not_compared(monkeypatch: pytest.MonkeyPat
 
 
 def test_jobs_are_matched_by_name_between_the_two_paths(monkeypatch: pytest.MonkeyPatch) -> None:
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     runs = [{"id": 1, "workflow_id": 7, "run_started_at": now, "updated_at": now}]
     artifacts = [
-        _artifact("carbon.v1.600.2.7168.ubuntu.eastus.build", 1),
-        _artifact("carbon.v1.600.2.7168.ubuntu.eastus.unit-tests", 1),
+        # The shape post.js writes: GITHUB_JOB plus a random 8-hex suffix.
+        _artifact("carbon.v1.600.2.7168.ubuntu.eastus.build-a1b2c3d4", 1),
+        _artifact("carbon.v1.600.2.7168.ubuntu.eastus.unit_tests-0f9e8d7c", 1),
     ]
     jobs = [
         _named_job(["ubuntu-latest"], 10, "build"),
@@ -1517,7 +1629,7 @@ def test_an_unmatched_job_still_counts_in_its_run(monkeypatch: pytest.MonkeyPatc
     """Slug matching is best effort — the sanitising happens in the reporting
     action, not here — so a miss must cost the per-job attribution and nothing
     else. Losing the run's energy over a name would be much worse."""
-    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     runs = [{"id": 1, "workflow_id": 7, "run_started_at": now, "updated_at": now}]
     artifacts = [_artifact("carbon.v1.600.2.7168.ubuntu.eastus.mystery-slug", 1)]
     jobs = [_named_job(["ubuntu-latest"], 10, "build")]
@@ -1566,3 +1678,55 @@ def test_reconcile_refuses_the_combinations_that_cannot_work(capsys: pytest.Capt
     ):
         with pytest.raises(SystemExit):
             carbon_badge.main(argv)
+
+
+# --- end to end ---------------------------------------------------------------
+
+
+def test_cli_prints_the_badge_for_a_github_repo(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The main journey: `carbon-badge owner/repo` reads the API with the env
+    token and prints Shields endpoint JSON, and nothing else, on stdout."""
+    seen_headers: list[dict[str, str]] = []
+
+    def fake_get(
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        timeout: float | None = None,
+    ) -> _FakeResponse:
+        seen_headers.append(headers or {})
+        page = _page(params)
+        if "/artifacts" in url:
+            return _FakeResponse({"artifacts": []})
+        if "/jobs" in url:
+            return _FakeResponse({"jobs": [_job(["ubuntu-latest"], 60)] if page == 1 else []})
+        return _FakeResponse({"workflow_runs": [{"id": 1}] if page == 1 else []})
+
+    monkeypatch.setenv("GITHUB_TOKEN", "t0ken")
+    monkeypatch.setattr(carbon_badge.ci.requests, "get", fake_get)
+
+    assert carbon_badge.main(["owner/repo", "--grid-intensity", "480"]) == 0
+
+    badge = json.loads(capsys.readouterr().out)
+    assert badge["schemaVersion"] == 1
+    assert badge["label"] == "CI carbon"
+    # One hour on the baseline runner, nothing self-reported.
+    assert badge["message"] == f"{format_grams(grams_co2e(60, 480.0))} (estimated)"
+    assert seen_headers
+    assert all(h.get("Authorization") == "Bearer t0ken" for h in seen_headers)
+
+
+def test_cli_offline_minutes_never_touch_the_network(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def no_network(*_: Any, **__: Any) -> NoReturn:
+        raise AssertionError("--minutes must not call the API")
+
+    monkeypatch.setattr(carbon_badge.ci.requests, "get", no_network)
+
+    assert carbon_badge.main(["owner/repo", "--minutes", "1000", "--grid-intensity", "480"]) == 0
+
+    assert json.loads(capsys.readouterr().out)["message"] == format_grams(grams_co2e(1000, 480.0))

@@ -6,7 +6,9 @@
 // returns names in its listing, 100 per request. A month of data therefore
 // costs one request and downloads nothing.
 //
-//   carbon.v1.<seconds>.<vcpu>.<memMB>.<platform>.<region>.<slug>
+//   carbon.v2.<seconds>.<vcpu>.<memMB>.<platform>.<region>.<cpu%>.<slug>
+//
+// or v1, without <cpu%>, when no utilisation could be measured.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -15,11 +17,12 @@ import path from "node:path";
 import * as core from "@actions/core";
 import { DefaultArtifactClient } from "@actions/artifact";
 import { isHosted, jobSeconds } from "./duration.js";
+import { cpuLoadPercent, cpuTimes } from "./load.js";
 
 // CPU and memory alone do not determine draw: the same 4 vCPU / 16 GiB reading
 // means a very different wattage on Apple silicon than on a shared x86 VM, so
 // the reader has to be told which. These names match its power table.
-function platform() {
+function powerPlatform() {
   if (os.platform() === "darwin") return "macos";
   if (os.platform() === "win32") return "windows";
   return os.arch() === "arm64" ? "arm" : "ubuntu";
@@ -47,7 +50,7 @@ function azureRegion(timeoutMs = 1000) {
       },
       (res) => {
         let body = "";
-        res.on("data", (c) => (body += c));
+        res.on("data", (chunk) => (body += chunk));
         res.on("end", () => {
           try {
             const loc = JSON.parse(body).location;
@@ -69,12 +72,12 @@ function azureRegion(timeoutMs = 1000) {
 }
 
 // Artifact names must be unique within a run, and a matrix produces several
-// jobs sharing one GITHUB_JOB. A random suffix removes the question — nothing
-// reads the slug, it only disambiguates.
+// jobs sharing one GITHUB_JOB. A random suffix removes the question; --reconcile
+// strips it again to match jobs by name, so keep it 8 hex characters.
 //
 // Artifact names may not contain " : < > | * ? \ / and the dot is our field
 // separator, so anything outside [A-Za-z0-9_-] is replaced.
-function slug() {
+function uniqueJobSlug() {
   const base = `${process.env.GITHUB_JOB || "job"}`.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 60);
   return `${base}-${crypto.randomBytes(4).toString("hex")}`;
 }
@@ -87,7 +90,17 @@ function sanitiseRegion(value) {
   return clean || "unknown";
 }
 
-async function run() {
+// The counters main.js saved, or null if it saved none or they do not parse.
+function savedCpuTimes() {
+  try {
+    const saved = JSON.parse(core.getState("carbonBadgeCpu") || "null");
+    return Number.isFinite(saved?.busy) && Number.isFinite(saved?.total) ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+async function recordJob() {
   const started = core.getState("carbonBadgeStart");
   if (!started) {
     core.warning("carbon-badge: no start state recorded; skipping.");
@@ -98,7 +111,12 @@ async function run() {
   // provisioning and setup this action cannot see from inside the job. See
   // duration.js.
   const hosted = isHosted();
-  const seconds = jobSeconds(started, Date.now(), os.uptime(), hosted);
+  const uptime = os.uptime();
+  const seconds = jobSeconds(started, Date.now(), uptime, hosted);
+  // jobSeconds returns the uptime only when it trusted it as the job's length;
+  // only then is boot the start of the CPU interval too.
+  const sinceBoot = hosted && seconds === Math.round(uptime);
+  const load = cpuLoadPercent(savedCpuTimes(), cpuTimes(os.cpus()), sinceBoot);
   const vcpu = os.cpus().length || 2;
   const memMb = Math.round(os.totalmem() / (1024 * 1024));
 
@@ -107,7 +125,9 @@ async function run() {
   const declared = core.getInput("region");
   const region = sanitiseRegion(declared || (await azureRegion()));
 
-  const name = `carbon.v1.${seconds}.${vcpu}.${memMb}.${platform()}.${region}.${slug()}`;
+  const fields = `${seconds}.${vcpu}.${memMb}.${powerPlatform()}.${region}`;
+  const name =
+    load === null ? `carbon.v1.${fields}.${uniqueJobSlug()}` : `carbon.v2.${fields}.${load}.${uniqueJobSlug()}`;
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "carbon-badge-"));
   const file = path.join(dir, "carbon-badge.txt");
@@ -118,8 +138,8 @@ async function run() {
       retentionDays: Number(core.getInput("retention-days") || 35),
     });
     core.info(
-      `carbon-badge: ${seconds}s on ${vcpu} vCPU / ${memMb} MB ` +
-        `(${platform()}, ${region}, ${hosted ? "hosted: includes setup" : "self-hosted: step time only"})`,
+      `carbon-badge: ${seconds}s on ${vcpu} vCPU / ${memMb} MB at ${load === null ? "unmeasured" : `${load}%`} CPU ` +
+        `(${powerPlatform()}, ${region}, ${hosted ? "hosted: includes setup" : "self-hosted: step time only"})`,
     );
   } catch (err) {
     // Telemetry must never fail somebody's build.
@@ -127,4 +147,4 @@ async function run() {
   }
 }
 
-run();
+recordJob();

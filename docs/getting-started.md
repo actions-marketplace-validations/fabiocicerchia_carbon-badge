@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Python 3.10+
+- Python 3.11+
 - A GitHub token with read access to the target repo's Actions
   (`GITHUB_TOKEN` in CI, or a PAT with `actions:read`).
 
@@ -89,8 +89,11 @@ One line, at the top of the job. Its `post:` step runs when the job ends and
 uploads a one-line artifact whose *name* carries the measurement:
 
 ```text
-carbon.v1.142.4.16384.ubuntu.eastus.build-a1b2c3d4   # 142 s, 4 vCPU, 16384 MB, x86 Linux, US-MIDA-PJM
+carbon.v2.142.4.16384.ubuntu.eastus.37.build-a1b2c3d4   # 142 s, 4 vCPU, 16384 MB, x86 Linux, US-MIDA-PJM, 37% CPU
 ```
+
+The CPU figure prices the job at its own load rather than at full load; see
+[the flat wattage](assumptions.md#the-flat-wattage-and-what-to-do-about-it).
 
 The artifacts API returns names in its listing, 100 per request, so nothing is
 downloaded. On a repo with ~400 runs a month that is roughly **20 requests
@@ -274,7 +277,7 @@ a shared host that is worth doing.
 ## Other CI systems
 
 The action wrapper is GitHub-specific; the CLI is not. Anything that can run
-Python 3.10+ and hold a token can refresh the badge:
+Python 3.11+ and hold a token can refresh the badge:
 
 ```sh
 docker run --rm -e GITHUB_TOKEN ghcr.io/fabiocicerchia/carbon-badge:0.2.1 \
